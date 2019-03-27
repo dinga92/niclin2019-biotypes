@@ -1,0 +1,556 @@
+---
+title: "Supplementary material - data analysis code"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: 3
+  html_document:
+    df_print: paged
+    toc: yes
+  html_notebook:
+    df_print: paged
+    toc: yes
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=F)
+```
+
+# 0. Data loading and preparation
+## Load data
+
+```{r}
+library(data.table)
+rs_connectivity <- as.data.frame(fread('./rs_connectivity_prepared.csv'))
+clinical <- read.csv('./clinical_prepared.csv')
+nuisance_covs <- read.csv('./nuisance_covs_prepared.csv')
+```
+
+Print number of rows of each loaded dataframe
+
+```{r}
+c('rs_connectivity' = nrow(rs_connectivity), 
+  'clinical' = nrow(clinical), 
+  'nuisance_covs' = nrow(nuisance_covs)) 
+```
+
+Are subjects in data frames in the same order?
+
+```{r}
+all(rs_connectivity$pident == nuisance_covs$pident)
+all(rs_connectivity$pident == clinical$pident) 
+```
+
+Throw away the subj.id column, because it is not needed anymore
+
+```{r}
+rs_connectivity <- rs_connectivity[, names(rs_connectivity) != 'subj.id']
+clinical <- clinical[, names(clinical) != 'subj.id']
+nuisance_covs <- nuisance_covs[, names(nuisance_covs) != 'subj.id'] 
+```
+
+Recode factor variables
+
+```{r}
+nuisance_covs$sex <- as.factor(nuisance_covs$sex)
+nuisance_covs$scan.location <- as.factor(nuisance_covs$scan.location) 
+```
+
+## Summary statistics
+
+Summary of all subjects
+
+```{r}
+summary(nuisance_covs) 
+```
+
+Summary of MOTAR subjects
+
+```{r}
+summary(nuisance_covs[nuisance_covs$scan.location == "MOTAR",]) 
+```
+
+Summary of NESDA subjects 
+
+```{r}
+summary(nuisance_covs[nuisance_covs$scan.location != "MOTAR",]) 
+```
+
+SD age: All/MOTAR/NESDA
+
+```{r}
+sd(nuisance_covs$age)
+sd(nuisance_covs[nuisance_covs$scan.location == "MOTAR",]$age)
+sd(nuisance_covs[nuisance_covs$scan.location != "MOTAR",]$age) 
+```
+
+## Delete variables with too many missing values
+
+```{r}
+rs_connectivity[rs_connectivity == 0] <- NA
+# is.na(rs_connectivity) <- !rs_connectivity
+
+num_na <- colSums(is.na(rs_connectivity))
+rs_connectivity <- rs_connectivity[,num_na < 20] 
+```
+
+## Fisher Z transform RS connectivity measures
+
+```{r, message=FALSE}
+library(psych)
+ztransformed_rs_connectivity <- fisherz(rs_connectivity) 
+```
+
+## Regress out age and scan location and framewise displacement
+
+
+```{r}
+residual_rs_connectivity <- matrix(NA,
+                                   nrow = nrow(ztransformed_rs_connectivity), 
+                                   ncol = ncol(ztransformed_rs_connectivity))
+
+for (i in 1:ncol(ztransformed_rs_connectivity)) {
+  fit <- lm(ztransformed_rs_connectivity[,i] ~ age + factor(scan.location) + 
+              frame.displacement,
+            data = nuisance_covs, na.action = na.exclude)
+  residual_rs_connectivity[,i] <- residuals(fit)
+}
+
+residual_rs_connectivity <- data.frame(residual_rs_connectivity)
+names(residual_rs_connectivity) <- names(residual_rs_connectivity)
+rm(ztransformed_rs_connectivity)
+rm(rs_connectivity)
+
+```
+
+## Median impute missing data 
+
+```{r, message=FALSE}
+library(caret)
+imputation <- preProcess(clinical, method = 'medianImpute')
+clinical <- predict(imputation, clinical)
+imputation <- preProcess(residual_rs_connectivity, method = 'medianImpute')
+residual_rs_connectivity <- predict(imputation, residual_rs_connectivity)
+```
+
+
+# 1. Canonical correlation analysis
+
+## Feature selection and CCA function
+
+Here we create a function that first selects resting state features (X) with the highest spearman correlation with any of clinical symptoms (Y) and then fits and returns a CCA model. This function will be used to compute canonical correalotions and also later for permutation test and cross-validation.
+
+```{r}
+select_and_cca_fit <- function(X, Y, n_selected_vars){
+  library(candisc)
+  #select
+  correlations <- cor(Y, X, method = "spearman")
+  correlations <- apply(correlations, 2, function(x){max(abs(x))})
+  corr.threshold <- sort(correlations, decreasing = T)[n_selected_vars]
+  selected.X <- correlations >= corr.threshold
+  selected.X <- X[,selected.X]
+  #cca fit
+  cca_model <- candisc::cancor(selected.X, Y)
+  #return fitted model containing canonical correlations and wilks lambdas
+  return(cca_model)
+}
+
+```
+
+## Canonical correlations
+
+Fit the feature selection and CCA model, selecting 150 features and print all canonical correlations
+
+```{r}
+n_selected_vars <- 150
+cca_model <- select_and_cca_fit(residual_rs_connectivity, 
+                                clinical, 
+                                n_selected_vars)
+cca_model$cancor
+```
+
+Create a function to compute canonical variates
+
+```{r}
+predict.cancor <- function(cancor.obj, X, Y){
+  X_pred <- as.matrix(X) %*% cancor.obj$coef$X
+  Y_pred <- as.matrix(Y) %*% cancor.obj$coef$Y
+  XY_pred <- list(X_pred, Y_pred)
+  names(XY_pred) <- c("X_pred", "Y_pred")
+  return(XY_pred)
+}
+```
+
+Visualize canonical correlations 
+
+```{r}
+canonical.variates <- predict.cancor(cca_model, 
+                               residual_rs_connectivity[,cca_model$names$X], 
+                               clinical)
+cca_y_loadings <- cor(clinical, canonical.variates$Y_pred)
+
+par(mfrow=c(1,2))
+plot(canonical.variates$X_pred[,1], 
+     canonical.variates$Y_pred[,1],
+     bty='n',
+     xlab='Connectivity canonical variate 1',
+     ylab='Clinical canonical variate 1')
+text(-2, 1,  bquote(r^2 == .(round(cca_model$cancor[1], 2))))
+
+plot(canonical.variates$X_pred[,2], 
+     canonical.variates$Y_pred[,2],
+     bty='n',
+     xlab='Connectivity canonical variate 2',
+     ylab='Clinical canonical variate 2')
+text(-2, 2,  bquote(r^2 == .(round(cca_model$cancor[2], 2))))
+
+```
+
+## Permutation test
+
+First get test statistics (canonical correlations and Wilks lambdas) from the real model 
+
+```{r}
+real_model <- cca_model
+real_results_cancor <- real_model$cancor
+real_results_wilks <- Wilks(real_model)$"LR test stat"
+```
+
+Obtain null distribution of test statistics by permuting rows of clinical data
+
+```{r}
+library(permute)
+library(doMC)
+registerDoMC(cores=4) # to run it multicore
+
+nperms = 1999
+set.seed(123)
+# shuffle within scan location
+shuffled_indexes <- sapply(1:nperms, function(x){
+                           shuffle(1:nrow(residual_rs_connectivity),
+                           control = how(blocks=nuisance_covs$scan.location))})
+
+null_results <- foreach(i=1:nperms) %dopar% {
+  null_model <- select_and_cca_fit(residual_rs_connectivity,
+                                    clinical[shuffled_indexes[,i],], 
+                                    n_selected_vars)
+  #return canonical correlations and wilks lambdas
+  list(null_model$cancor, Wilks(null_model)$"LR test stat")
+}
+
+# transform null results lists to data frame
+null_dist_cancor <- lapply(null_results, function(x){return(x[[1]])})
+null_dist_wilks <- lapply(null_results, function(x){return(x[[2]])})
+null_dist_cancor <- as.data.frame(do.call(rbind, null_dist_cancor))
+null_dist_wilks <- as.data.frame(do.call(rbind, null_dist_wilks))
+
+get_pval <- function(real, null_dist, better="smaller"){
+  if (better == "smaller"){
+    rank <- sum(real < null_dist) + 1
+  }
+  if (better == "bigger"){
+    rank <- sum(real > null_dist) + 1
+  }
+  pval <- rank / (length(null_dist) + 1)
+  return(pval)
+}
+
+pvals_cancor <- mapply(function(real, null_dist){
+                         get_pval(real, null_dist, better="smaller")},
+                       real_results_cancor,
+                       null_dist_cancor)
+pvals_wilks <- mapply(function(real, null_dist){
+                        get_pval(real, null_dist, better="bigger")},
+                       real_results_wilks,
+                       null_dist_wilks)
+```
+
+Print p-values
+
+```{r}
+print(cbind("component"=1:length(pvals_cancor), pvals_cancor, pvals_wilks))
+```
+
+Visualize null distributions and p-values for first two canonical correlations
+
+```{r}
+par(mfrow=c(2,1))
+for (i in 1:2){
+  hist(null_dist_cancor[,i], breaks = 25, main = paste("Null dist corr CV", i),
+       xlim=c(0.9,1))
+  abline(v=real_results_cancor[i], col="red")
+}
+```
+
+## Cross-validation
+
+Create function that performs cross-validation
+
+```{r}
+cca_cv <- function(rs_variables, clinical_variables, n_selected_vars, site){
+  library(caret)
+  n_folds <- 10
+  folds <- createFolds(as.factor(site), n_folds, list=F)
+  results_cancor <- list()
+  for (fold in 1:n_folds) {
+    # create training and test set
+    train_brain <- rs_variables[folds != fold,]
+    train_clinical <- clinical_variables[folds != fold,]
+    test_brain <- rs_variables[folds == fold,]
+    test_clinical <- clinical_variables[folds == fold,]
+    # fit on training set
+    cancor.fit <- select_and_cca_fit(train_brain, 
+                                     train_clinical, 
+                                     n_selected_vars)
+    # predict on test set
+    XY_pred_cancor <- predict.cancor(cancor.fit, 
+                                     test_brain[,cancor.fit$names$X],
+                                     test_clinical)
+    results_cancor[[fold]] <- diag(cor(XY_pred_cancor[[1]], 
+                                       XY_pred_cancor[[2]]))
+  }
+  return(do.call(rbind, results_cancor))
+}
+
+```
+
+Run cross-validation and print out of sample canonical correlations per CV fold for first two canonical variates
+
+```{r}
+set.seed(123)
+# we have 90% of subjects in the training set, so we will use 90% of variables
+n_cv_selected_vars <- as.integer(n_selected_vars*0.9)
+results_cca_cv <- cca_cv(residual_rs_connectivity, 
+                         clinical, 
+                         n_cv_selected_vars, 
+                         nuisance_covs$scan.location)
+results_cca_cv <- results_cca_cv[,1:2]
+colnames(results_cca_cv) <- c("CV1", "CV2")
+results_cca_cv
+colMeans(results_cca_cv)
+```
+
+Visualize out of sample cannonical correlations
+
+```{r}
+plot(cbind(results_cca_cv[,1], results_cca_cv[,2]), 1:20, 
+     yaxt="n",
+     xlim=c(-1, 1),
+     bty='n',
+     ylab='Cross-validation fold',
+     xlab='Test-set correlation',
+     main='Out of sample correlation',
+     pch=c(rep(19,10), rep(1,10)))
+
+axis(2, at=c(1:20), labels=c(10:1, 10:1))#, lty='blank')
+abline(v=0, col='grey')
+legend("topleft", c('CV1', 'CV2'), bty='n', pch=c(19,1))
+
+```
+
+## Stability of canonical loadings
+
+Create function that performes leave-one-out jackknife procedure to get uncertainity of canonical loadings taking into an account uncertainity caused by feature selection. 
+
+Jackknife repeatedly leaves one subject out and then performs the feature selection and CCA procedure in the same way as above. 
+
+```{r}
+njack <- nrow(residual_rs_connectivity)
+jack_res <- foreach(i=1:njack) %dopar% {
+  model <- select_and_cca_fit(residual_rs_connectivity[-i,],
+                               clinical[-i,],
+                               n_selected_vars)
+  selected.vars <- model$names$X
+  prediction <- predict.cancor(model, 
+                               residual_rs_connectivity[i, selected.vars], 
+                               clinical[i,])
+  list(prediction, model)
+}
+```
+
+run jackknife
+
+```{r}
+jack.results <- lapply(jack_res, function(x){return(x[[1]])})
+jack.X <- lapply(jack.results, function(x){return(x[[1]])})
+jack.X <- as.data.frame(do.call(rbind, jack.X))
+jack.Y <- lapply(jack.results, function(x){return(x[[2]])})
+jack.Y <- as.data.frame(do.call(rbind, jack.Y))
+```
+
+get loadings from saved jackknife models
+
+```{r}
+jack_models <- lapply(jack_res, function(x){return(x[[2]])})
+jack.loadings <- lapply(jack_models, function(model){
+  return(model$structure$Y.yscores[,1])})
+jack.loadings <- as.data.frame(do.call(rbind, jack.loadings))
+```
+
+plot distribution of canonical loadings across all jackknife models
+
+```{r, message=F}
+library(reshape2)
+melted.loadings <- melt(jack.loadings)
+
+par(mfrow=c(1,2), las=1, mai=c(1.02, 1.3, 0.82, 0.42))
+boxplot(abs(value) ~ variable, data=melted.loadings, horizontal=T)
+plot(abs(melted.loadings$value), 
+     jitter(as.numeric(melted.loadings$variable)), 
+     pch='.')
+```
+
+
+## Compare loadings with original study
+
+Canonical loadings as presented in original study
+
+```{r}
+Drysdale_1 <- c( 0, 0.41, 0.32, 0.59, 0.54, 0, 0, 0, 0, 0, 
+                 0.65, 0, 0, 0.24, 0.25, 0, 0)
+Drysdale_2 <- c(0.27, 0.25, 0.26, 0, 0, 0, 0.83, 0.36, 0.23,
+                0, 0, 0, -0.35, 0, 0.21, 0, 0)
+```
+
+Plot loadings obtained above together with loadings from the original study
+
+```{r}
+
+dr_c <- rbind(Drysdale_1, Drysdale_2)
+
+new_cors <- rbind(t(cca_y_loadings), dr_c)
+new_cors_thr <- new_cors
+new_cors_thr[abs(new_cors) < 0.2] = 0
+
+library(corrplot)
+corrplot(new_cors, method = 'color', cl.ratio=0.1, cl.align = 'l',
+         addCoef.col = "black", tl.srt = 45,number.cex = .5, 
+         col=colorRampPalette(c("blue", "white", "red"))(200))
+```
+
+
+# 2. Clustering analysis
+
+## Run hierarchical clustering
+
+Plot subjects based on their first 2 RS canonical variates values and their 4 cluster solution as in the original study
+
+```{r}
+par(mfrow=c(1,2))
+cca_rs_data <- canonical.variates$X_pred[,1:2]
+plot(cca_rs_data, 
+     xlab = "RS connectivity variate 1", ylab = "RS connectivity variate 2")
+
+library(stats)
+d <- dist(cca_rs_data, method = "euclidean")
+res.hc <- hclust(d, method = "ward.D" ) 
+clusters <- cutree(res.hc, k = 4)
+plot(cca_rs_data, 
+     xlab = "RS connectivity variate 1", ylab = "RS connectivity variate 2", 
+     col=clusters)
+```
+
+## Stability of cluster assignment
+
+We will make the same plot as above but we will use canonical variates from one of jackknife models estimated before (by leaving one subject out) but using colors according to previous cluster assignment. Thus showing how relative positions of subjects change with respect to small perturbation of the data. 
+
+```{r}
+jack.pred <- lapply(jack_models, function(model){
+                      predict.cancor(model,
+                                     residual_rs_connectivity[,model$names$X],
+                                     clinical)})
+par(mfrow=c(1,2))
+plot(cca_rs_data, col=clusters,  
+     xlab = "RS connectivity variate 1", 
+     ylab = "RS connectivity variate 2")
+plot((-1)*jack.pred[[1]]$X_pred[,1], jack.pred[[1]]$X_pred[,2], col=clusters,  
+     xlab = "refited RS connectivity variate 1", 
+     ylab = "refited RS connectivity variate 2")
+```
+
+##  Clustering indeces
+
+Compute and plot clustering indexes
+
+```{r}
+library(NbClust)
+hcfit_ch <- NbClust(cca_rs_data, method="ward.D", 
+                 min.nc = 2, max.nc = 6, index = "ch")
+hcfit_sl <- NbClust(cca_rs_data, method="ward.D", 
+                 min.nc = 2, max.nc = 6, index = "silhouette")
+
+par(mfrow=c(1,2))
+plot(names(hcfit_ch$All.index), hcfit_ch$All.index, 
+     main = "variance ratio criterion\n (Calinski-Harabasz index)", 
+     xlab = "Number of clusters", ylab="variance ratio criterion", type='b')
+plot(names(hcfit_sl$All.index), hcfit_sl$All.index, 
+     main = "Silhoutte", xlab = "Number of clusters", ylab="Silhoutte", 
+     type='b')
+```
+
+
+## Statisticall significance of clusters
+
+Make a function that performs a hierarchical clustering and return the highest clustering indexes
+
+```{r, message=F}
+cluster_test <- function(cca_data){
+  #ugly hack, because i don't know how to prevent this library creating many plots
+  hcfit <- NbClust(cca_data, method="ward.D", index="ch", min.nc=3, max.nc = 5)
+  CH_index <- max(hcfit$All.index)
+  hcfit <- NbClust(cca_data, method="ward.D", index="silhouette", min.nc=3, max.nc = 5)
+  sil_index <- max(hcfit$All.index)
+  return(c("CH"=CH_index, "Silhouette"=sil_index))
+}
+```
+
+Fit a multivariate normal distribution to the same data used to perform hierarchical clustering
+
+```{r}
+library(MASS)
+sigma <- cov(cca_rs_data)
+mu <- colMeans(cca_rs_data)
+real_CI <- cluster_test(cca_rs_data)
+```
+
+Repeatedly perform hierarchical clustering on samples from this distribution, thus creating an empirical null distribution of clustering indeces
+
+```{r}
+# get a null distribution of clusters
+null_CI <- list()
+n_sims <- 1999
+for (i in 1:n_sims){
+  rand_sample <- mvrnorm(n=nrow(cca_rs_data), mu=mu, Sigma=sigma)
+  null_CI[[i]] <- cluster_test(rand_sample)
+}
+null_CI <- as.data.frame(do.call(rbind, null_CI))
+```
+
+print p-values
+
+```{r}
+rank_cv1 <- sum(real_CI[1] < null_CI[,1]) + 1
+pval_cv1 <- rank_cv1 / (n_sims+1)
+rank_cv2 <- sum(real_CI[2] < null_CI[,2]) + 1
+pval_cv2 <- rank_cv2 / (n_sims+1)
+t(t((c("p.val variance ratio"=pval_cv1, "p.val Silhouette"=pval_cv2))))
+```
+
+visualize null distribution
+
+```{r}
+par(mfrow=c(1,2))
+hist(null_CI[,1], breaks = 30, main = "variance ratio criterion null")
+abline(v=real_CI[1], col="red")
+text(real_CI[1] + 10, 70, paste('p = ', round(pval_cv1, 2)))
+
+hist(null_CI[,2], breaks = 30, main = "Silhouette null")
+abline(v=real_CI[2], col="red")
+text(real_CI[2] - 0.025, 80, paste('p = ', round(pval_cv2, 2)))
+```
+
+# 3. Software enviroment
+```{r}
+sessionInfo()
+```
